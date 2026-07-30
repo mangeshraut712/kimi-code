@@ -1,5 +1,11 @@
 # @moonshot-ai/kimi-code
 
+## 0.31.1
+
+### Patch Changes
+
+- [#2410](https://github.com/MoonshotAI/kimi-code/pull/2410) [`f1a3475`](https://github.com/MoonshotAI/kimi-code/commit/f1a3475ad5d6540447496701aa75fd4b035ecb28) Thanks [@sailist](https://github.com/sailist)! - Fix sporadic "model is not configured" errors when starting kimi web, caused by the background provider-model refresh transiently clearing the model catalog while the first session was being created.
+
 ## 0.31.0
 
 ### Minor Changes
