@@ -769,6 +769,7 @@ describe('agent profile loaders + session catalog', () => {
         const refreshed = new Promise<string>((resolvePromise) => {
           const d = stack.catalog.onDidChange((sourceId) => {
             if (sourceId !== 'workspace') return;
+            if (stack.catalog.get('watched-agent') === undefined) return;
             d.dispose();
             resolvePromise(sourceId);
           });
