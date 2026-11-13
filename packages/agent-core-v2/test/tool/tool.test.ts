@@ -1476,8 +1476,12 @@ describe('Agent tool execution contract', () => {
 
   afterEach(async () => {
     vi.useRealTimers();
-    await ctx?.dispose();
-    ctx = undefined;
+    try {
+      await ctx?.dispose();
+    } finally {
+      vi.unstubAllEnvs();
+      ctx = undefined;
+    }
   });
 
   function createAgentToolContext(
@@ -3800,6 +3804,7 @@ describe('Agent tool execution contract', () => {
   });
 
   it('treats timeoutMs=0 as no deadline for background subagents and preserves the metadata', async () => {
+    vi.stubEnv('KIMI_CODE_WATCH', 'false');
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     const completion = deferred<{ readonly summary: string }>();
     const lifecycle = createAgentLifecycleStub({
@@ -3845,6 +3850,7 @@ describe('Agent tool execution contract', () => {
   });
 
   it('runs foreground subagents without a deadline under print mode defaults', async () => {
+    vi.stubEnv('KIMI_CODE_WATCH', 'false');
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     const completion = deferred<{ readonly summary: string }>();
     const lifecycle = createAgentLifecycleStub({
@@ -3892,6 +3898,7 @@ describe('Agent tool execution contract', () => {
   });
 
   it('runs background subagents without a deadline under print mode defaults', async () => {
+    vi.stubEnv('KIMI_CODE_WATCH', 'false');
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     const completion = deferred<{ readonly summary: string }>();
     const lifecycle = createAgentLifecycleStub({
