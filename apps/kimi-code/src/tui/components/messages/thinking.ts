@@ -214,7 +214,7 @@ export class ThinkingComponent implements Component {
 
   private startFrames(): void {
     if (this.ui === undefined || this.frameRequest !== undefined) return;
-    this.sweep.start(performance.now());
+    this.sweep.start(performance.now(), true);
     this.frameRequest = this.ui.requestAnimationFrame(this.onFrame);
   }
 
@@ -244,7 +244,7 @@ function sameFinishedForm(left: FinishedThinkingForm, right: FinishedThinkingFor
 function openedTitle(title: string, width: number): string {
   const dim = (text: string): string => currentTheme.fg('textDim', text);
   return renderHeaderContent({
-    head: `${dim(STATUS_BULLET.trimEnd())} `,
+    head: '  ',
     flex: { text: title, style: dim, keep: 'head' },
     tail: '',
   }, width);

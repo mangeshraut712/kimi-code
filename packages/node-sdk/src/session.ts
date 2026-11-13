@@ -1,3 +1,4 @@
+import type { PromptPredictionCancelReason } from '@moonshot-ai/agent-core-v2/features/promptPrediction/promptPrediction';
 import type { SwarmModeTrigger } from '@moonshot-ai/agent-core-v2/features/swarm/agent/swarm';
 
 import type { AgentContextData } from '#/context';
@@ -261,6 +262,22 @@ export class Session {
   async startBtw(): Promise<string> {
     this.ensureOpen();
     return this.rpc.startBtw({ sessionId: this.id });
+  }
+
+  async predictNextPrompt(input: {
+    predictionId: string;
+    expectedTurnId: number;
+  }): Promise<string | null> {
+    this.ensureOpen();
+    return this.rpc.predictNextPrompt({ sessionId: this.id, ...input });
+  }
+
+  async cancelPromptPrediction(
+    predictionId: string,
+    reason?: PromptPredictionCancelReason,
+  ): Promise<boolean> {
+    this.ensureOpen();
+    return this.rpc.cancelPromptPrediction({ sessionId: this.id, predictionId, reason });
   }
 
   async cancel(): Promise<void> {
@@ -742,7 +759,11 @@ export class Session {
     return this.rpc.getPluginInfo(id);
   }
 
-  async activateSkill(name: string, args?: string | undefined): Promise<void> {
+  async activateSkill(
+    name: string,
+    args?: string | undefined,
+    options?: { readonly path?: string },
+  ): Promise<void> {
     this.ensureOpen();
     const skillName = normalizeRequiredString(
       name,
@@ -753,6 +774,7 @@ export class Session {
     await this.rpc.activateSkill({
       sessionId: this.id,
       name: skillName,
+      path: options?.path,
       ...(skillArgs !== undefined ? { args: skillArgs } : {}),
     });
   }

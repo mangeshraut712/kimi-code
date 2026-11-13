@@ -31,6 +31,7 @@ import {
   type Component,
   type Focusable,
   getCapabilities,
+  isKittyProtocolActive,
   Key,
   matchesKey,
   Spacer,
@@ -42,7 +43,7 @@ import { resolve } from 'pathe';
 import type { CLIOptions } from '#/cli/options';
 import { MigrationScreenComponent, type MigrationScreenResult } from '#/migration/index';
 import { copyTextToClipboard } from '#/utils/clipboard/clipboard-text';
-import { appendInputHistory, loadInputHistory } from '#/utils/history/input-history';
+import { appendInputHistory, inputHistoryEntryEquals, loadInputHistory, type InputHistoryEntry } from '#/utils/history/input-history';
 import { openUrl } from '#/utils/open-url';
 import { getInputHistoryFile } from '#/utils/paths';
 import { refreshModelSwitchConfirmConfig } from '#/utils/model-switch-confirm-config';
@@ -68,6 +69,7 @@ import {
   type SkillListSession,
 } from './commands';
 import * as slashCommands from './commands/dispatch';
+import { resolveUserInput, skillVariantPathsForInput } from './commands/resolve';
 import { applyTranscriptPresentation, runQueuedModelSwitch } from './commands/config';
 import { promptSshPassword } from './commands/prompts';
 import { CacheHintController } from './controllers/cache-hint-controller';
@@ -75,7 +77,7 @@ import { BannerComponent } from './components/chrome/banner';
 import { DeviceCodeBoxComponent } from './components/chrome/device-code-box';
 import type { FooterGitBinding } from './components/chrome/footer';
 import { GutterContainer } from './components/chrome/gutter-container';
-import { MoonLoader, type SpinnerStyle } from './components/chrome/moon-loader';
+import { MoonLoader, type SpinnerLabel, type SpinnerStyle } from './components/chrome/moon-loader';
 import { WelcomeComponent } from './components/chrome/welcome';
 import { pickRandomWorkingTip } from './components/chrome/working-tips';
 import {
@@ -87,7 +89,7 @@ import {
   type ApprovalPreviewBlock,
 } from './components/dialogs/approval-preview';
 import { CompactionComponent } from './components/dialogs/compaction';
-import { HelpPanelComponent } from './components/dialogs/help-panel';
+import { HelpPanelComponent, keyboardShortcuts } from './components/dialogs/help-panel';
 import { QuestionDialogComponent } from './components/dialogs/question-dialog';
 import { SessionPickerComponent, type SessionRow } from './components/dialogs/session-picker';
 import { TrustPromptComponent, type TrustPromptChoice } from './components/dialogs/trust-prompt';
@@ -118,8 +120,16 @@ import { UserMessageComponent } from './components/messages/user-message';
 import {
   ActivityPaneComponent,
   type ActivityPaneMode,
+  LastTurnSummary,
 } from './components/panes/activity-pane';
-import { removeLegacySurveySetting, transcriptGroupingActive, type TuiConfig } from './config';
+import {
+  removeLegacySurveySetting,
+  resolveFollowUpBehavior,
+  transcriptGroupingActive,
+  type FollowUpDelivery,
+  type TuiConfig,
+  type TuiMode,
+} from './config';
 import {
   LLM_NOT_SET_MESSAGE,
   MAIN_AGENT_ID,
@@ -139,6 +149,7 @@ import { ClipboardImageHintController } from './controllers/clipboard-image-hint
 import { EditorKeyboardController } from './controllers/editor-keyboard';
 import { ModelMigrationController } from './controllers/model-migration';
 import { ProgramStatusController } from './controllers/program-status';
+import { PromptPredictionController } from './controllers/prompt-prediction';
 import { SessionEventHandler } from './controllers/session-event-handler';
 import { showSessionOccupancyPrompt } from './controllers/session-occupancy';
 import { SessionReplayRenderer } from './controllers/session-replay';
@@ -174,15 +185,18 @@ import {
   type QueuedPromptMessage,
   type EnvironmentSlotState,
   type SteerInputItem,
+  type SteerOutcome,
   type StepRetryState,
   type TranscriptEntry,
   type TUIStartupOptions,
   type TUIStartupState,
 } from './types';
+import { workingLabel } from './utils/activity-label';
 import { hasDispose } from './utils/component-capabilities';
 import { isDeadTerminalError } from './utils/dead-terminal';
 import { formatErrorMessage } from './utils/event-payload';
 import { pickForegroundTasks } from './utils/foreground-task';
+import { findInlineSkillTokens, rebaseInlineSkillActivations } from './utils/inline-skill-tokens';
 import { ImageAttachmentStore, type ImageAttachment, type MediaAttachment } from './utils/image-attachment-store';
 import {
   extractMediaAttachments,
@@ -219,10 +233,14 @@ import { installTerminalThemeTracking } from './utils/terminal-theme';
 import { detectTmuxKeyboardWarning } from './utils/tmux-keyboard';
 import {
   getTranscriptComponentEntry,
+  getTranscriptComponentTurnId,
   markTranscriptComponent,
+  markTranscriptComponentTurnId,
 } from './utils/transcript-component-metadata';
 import { isTurnBoundaryComponent } from './utils/transcript-turns';
+import { isPinnedToolCallComponent } from './utils/transcript-items';
 import { nextTranscriptId } from './utils/transcript-id';
+import { instant } from './utils/turn-timeline';
 import {
   TRANSCRIPT_HYSTERESIS,
   TRANSCRIPT_KEEP_RECENT_ASSISTANT,
@@ -249,6 +267,8 @@ export interface KimiTUIStartupInput {
   readonly agentProfile?: string;
   readonly additionalDirs?: readonly string[];
   readonly tuiConfig: TuiConfig;
+  readonly resolvedTuiMode?: TuiMode;
+  readonly animationFrameRate?: number;
   readonly version: string;
   readonly workDir: string;
   readonly startupNotice?: string;
@@ -315,10 +335,12 @@ function createInitialAppState(input: KimiTUIStartupInput): AppState {
     version: input.version,
     editorCommand: input.tuiConfig.editorCommand,
     disablePasteBurst: input.tuiConfig.disablePasteBurst,
+    copyOnSelect: input.tuiConfig.copyOnSelect,
     renderLatex: input.tuiConfig.renderLatex,
     cacheExpiryHint: input.tuiConfig.cacheExpiryHint,
     disableFeedbackSurvey: input.tuiConfig.disableFeedbackSurvey,
     autoSessionTitle: input.tuiConfig.autoSessionTitle,
+    followUpBehavior: input.tuiConfig.followUpBehavior,
     notifications: input.tuiConfig.notifications,
     upgrade: input.tuiConfig.upgrade,
     statusLine: input.tuiConfig.statusLine,
@@ -350,6 +372,7 @@ interface SendMessageOptions {
 
 type EnqueueMessageOptions = SendMessageOptions & {
   readonly inlineSkillActivations?: readonly InlineSkillActivation[];
+  readonly holdUntilTurnEnds?: boolean;
 };
 
 /** How long the one-shot "moved to background" footer hint stays visible. */
@@ -386,6 +409,8 @@ export class KimiTUI {
   private surveySettingSubscription: Unsubscribe | undefined;
   private skillCommands: readonly KimiSlashCommand[] = [];
   readonly skillCommandMap = new Map<string, string>();
+  private readonly skillCommandDefaultPaths = new Map<string, string>();
+  private readonly skillVariantPaths = new Map<number, { commandName: string; path: string }>();
   private pluginCommands: readonly KimiSlashCommand[] = [];
   readonly pluginCommandMap = new Map<string, string>();
   private readonly imageStore = new ImageAttachmentStore();
@@ -418,7 +443,10 @@ export class KimiTUI {
   private currentLoadingTip: { kind: LoadingTipKind; tip: string | undefined } | undefined =
     undefined;
   private activityHintTimer: ReturnType<typeof setTimeout> | undefined;
-  private lastHistoryContent: string | undefined;
+  private lastHistoryEntry: InputHistoryEntry | undefined;
+  private inputHistoryEntries: InputHistoryEntry[] = [];
+  private inputHistoryRecallIndex = -1;
+  private inputHistoryDraftVariants: Map<number, { commandName: string; path: string }> | undefined;
   // Live `!` shell output entries, keyed by commandId so concurrent commands
   // each update their own card and stale events are dropped. Mutated in place
   // as `shell.output` events arrive; removed when the command completes.
@@ -437,6 +465,7 @@ export class KimiTUI {
   readonly surveyController: SurveyController;
   readonly editorKeyboard: EditorKeyboardController;
   readonly modelMigration: ModelMigrationController;
+  readonly promptPredictionController: PromptPredictionController;
   private editorReplacementOnDisplaced: (() => void) | undefined;
   private editorReplacementOnReplaced: (() => void) | undefined;
   private editorReplacementOwner: ReverseRpcModalOwner | undefined;
@@ -502,6 +531,8 @@ export class KimiTUI {
     });
     const tuiOptions: KimiTUIOptions = {
       initialAppState: createInitialAppState(startupInput),
+      resolvedTuiMode: startupInput.resolvedTuiMode,
+      animationFrameRate: startupInput.animationFrameRate,
       startup: {
         sessionFlag: startupInput.cliOptions.session,
         continueLast: startupInput.cliOptions.continue,
@@ -574,6 +605,7 @@ export class KimiTUI {
       this.setAppState({ disableFeedbackSurvey: change.value === true ? true : undefined });
     });
     this.streamingUI = new StreamingUIController(this);
+    this.state.transcriptContainer.setTimeline(this.streamingUI.timeline);
     this.authFlow = new AuthFlowController(this);
     this.btwPanelController = new BtwPanelController(this, this.imageStore, this.staging);
     this.sessionEventHandler = new SessionEventHandler(this);
@@ -584,6 +616,7 @@ export class KimiTUI {
       telemetryDisabled: () => isTelemetryDisabledByEnv() || this.telemetryDisabled,
     });
     this.modelMigration = new ModelMigrationController(this);
+    this.promptPredictionController = new PromptPredictionController(this);
     this.editorKeyboard = new EditorKeyboardController(this, this.imageStore);
     this.editorKeyboard.install();
     this.buildLayout();
@@ -607,6 +640,10 @@ export class KimiTUI {
         name: cmd.name,
         aliases: cmd.aliases,
         description: cmd.description,
+        skillPath: cmd.skillPath,
+        skillSource: cmd.skillSource,
+        isSkill: cmd.isSkill,
+        workspaceDir: cmd.workspaceDir,
         ...(cmd.argumentHint !== undefined ? { argumentHint: cmd.argumentHint } : {}),
         ...(completer !== undefined
           ? { getArgumentCompletions: (prefix: string) => completer(prefix) }
@@ -623,6 +660,7 @@ export class KimiTUI {
             const result = await this.harness.suggestFiles(this.state.appState.workDir, {
               query,
               sessionId: session.id,
+              followGitignore: false,
             });
             return result?.items;
           };
@@ -634,6 +672,12 @@ export class KimiTUI {
       () => this.state.appState.inputMode,
       skillCommandNames,
       remoteSuggest,
+      ({ commandName, path, start }) => {
+        this.skillVariantPaths.set(start, {
+          commandName: commandName.startsWith('skill:') ? commandName : `skill:${commandName}`,
+          path,
+        });
+      },
     );
     this.state.editor.setAutocompleteProvider(provider);
 
@@ -707,12 +751,55 @@ export class KimiTUI {
 
   private applySkillCommands(skills: readonly SkillSummary[]): void {
     const skillCommands = buildSkillSlashCommands(skills);
+    const pathsBySkillName = new Map<string, Set<string>>();
+    for (const command of skillCommands.commands) {
+      const skillName = skillCommands.commandMap.get(command.name);
+      if (skillName === undefined || command.skillPath === undefined) continue;
+      const paths = pathsBySkillName.get(skillName) ?? new Set<string>();
+      paths.add(command.skillPath);
+      pathsBySkillName.set(skillName, paths);
+    }
     this.skillCommands = skillCommands.commands;
     this.skillCommandMap.clear();
     for (const [commandName, skillName] of skillCommands.commandMap) {
       this.skillCommandMap.set(commandName, skillName);
     }
+    this.skillCommandDefaultPaths.clear();
+    for (const [commandName, path] of skillCommands.defaultPaths) {
+      this.skillCommandDefaultPaths.set(commandName, path);
+    }
+    for (const [start, selection] of this.skillVariantPaths) {
+      const skillName = this.skillCommandMap.get(selection.commandName) ??
+        this.skillCommandMap.get(selection.commandName.replace(/^skill:/, ''));
+      if (skillName === undefined || !pathsBySkillName.get(skillName)?.has(selection.path)) {
+        this.skillVariantPaths.delete(start);
+      }
+    }
     this.setupAutocomplete();
+  }
+
+  retainSkillVariantSelection(text: string): void {
+    if (this.skillVariantPaths.size === 0) return;
+    const tokens = findInlineSkillTokens(text, { isKnownSkill: () => true, includeLeading: true });
+    for (const [start, selection] of this.skillVariantPaths) {
+      const token = tokens.find((candidate) => candidate.start === start);
+      const commandName = token?.commandName;
+      if (commandName !== selection.commandName && `skill:${commandName}` !== selection.commandName) {
+        this.skillVariantPaths.delete(start);
+      }
+    }
+  }
+
+  skillVariantPathForCommand(commandName: string, tokenStart: number): string | undefined {
+    const selection = this.skillVariantPaths.get(tokenStart);
+    if (selection?.commandName !== commandName && selection?.commandName !== `skill:${commandName}`) return undefined;
+    return selection.path;
+  }
+
+  defaultSkillPathForCommand(commandName: string): string | undefined {
+    const normalized = commandName.toLowerCase();
+    return this.skillCommandDefaultPaths.get(commandName) ?? this.skillCommandDefaultPaths.get(normalized) ??
+      this.skillCommandDefaultPaths.get(`skill:${normalized}`);
   }
 
   async refreshPluginCommands(session?: Session): Promise<void> {
@@ -1136,8 +1223,8 @@ export class KimiTUI {
     this.sessionEventHandler.notifications.setEnabled(isExperimentalFlagEnabled('notify_user'));
     if (this.state.ui instanceof TuiAltScreen) {
       this.track('transcript_display_settings', {
-        group_tools: this.state.appState.transcript.groupTools,
-        group_thinking: this.state.appState.transcript.groupThinking,
+        tool_call_density: this.state.appState.transcript.toolCallDensity,
+        thinking: this.state.appState.transcript.thinking,
         source: 'startup',
       });
     }
@@ -1292,6 +1379,7 @@ export class KimiTUI {
     this.streamingUI.clearActiveCompaction();
     this.streamingUI.resetToolUi();
     this.disposeTranscriptChildren();
+    this.promptPredictionController.dispose();
     this.editorKeyboard.dispose();
     this.surveyController.dispose();
     this.surveySettingSubscription?.();
@@ -1478,6 +1566,7 @@ export class KimiTUI {
   // =========================================================================
 
   handlePlanToggle(next: boolean): void {
+    this.promptPredictionController.handlePlanModeChanged(next);
     void slashCommands.handlePlanCommand(this, next ? 'on' : 'off');
   }
 
@@ -1487,7 +1576,7 @@ export class KimiTUI {
     this.updateEditorBorderHighlight();
   }
 
-  handleUserInput(text: string): void {
+  handleUserInput(text: string, delivery: FollowUpDelivery = 'default'): void {
     const wasBashMode = this.state.appState.inputMode === 'bash';
     if (wasBashMode) {
       // A submit always exits bash mode (the `!` is consumed by this command).
@@ -1516,7 +1605,7 @@ export class KimiTUI {
       void this.runShellCommandFromInput(text);
       return;
     }
-    slashCommands.dispatchInput(this, text);
+    slashCommands.dispatchInput(this, text, delivery);
   }
 
   private async runShellCommandFromInput(command: string): Promise<void> {
@@ -1652,7 +1741,11 @@ export class KimiTUI {
     this.updateQueueDisplay();
   }
 
-  async sendNormalUserInput(text: string, preExtracted?: ExtractionResult): Promise<void> {
+  async sendNormalUserInput(
+    text: string,
+    preExtracted?: ExtractionResult,
+    delivery: FollowUpDelivery = 'default',
+  ): Promise<void> {
     if (this.btwPanelController.sendUserInput(text)) return;
     if (this.state.appState.model.trim().length === 0) {
       this.showError(LLM_NOT_SET_MESSAGE);
@@ -1738,9 +1831,9 @@ export class KimiTUI {
         imageAttachmentIds: extraction.imageAttachmentIds,
         videoAttachmentIds: extraction.videoAttachmentIds,
         lease: stagingLease,
-      });
+      }, delivery);
     } else {
-      this.sendMessage(session, text);
+      this.sendMessage(session, text, undefined, delivery);
     }
     this.updateQueueDisplay();
     this.state.ui.requestRender();
@@ -1750,6 +1843,7 @@ export class KimiTUI {
     text: string,
     activations: readonly InlineSkillActivation[],
     preExtracted?: ExtractionResult,
+    delivery: FollowUpDelivery = 'default',
   ): Promise<void> {
     if (this.btwPanelController.sendUserInput(text, activations)) return;
     if (this.state.appState.model.trim().length === 0) {
@@ -1803,19 +1897,24 @@ export class KimiTUI {
         return;
       }
     }
+    const enqueueOptions: EnqueueMessageOptions = {
+      parts: extraction.hasMedia ? extraction.parts : undefined,
+      imageAttachmentIds: extraction.imageAttachmentIds,
+      videoAttachmentIds: extraction.videoAttachmentIds,
+      mediaSnapshots: extraction.mediaSnapshots,
+      inlineSkillActivations: activations,
+    };
+    if (delivery === 'steer-draft' && this.trySteerDraft(session, text, enqueueOptions)) {
+      this.state.ui.requestRender();
+      return;
+    }
     if (
       this.deferUserMessages ||
       this.steeringQueuedMessages.size > 0 ||
       this.state.appState.streamingPhase !== 'idle' ||
       this.state.appState.isCompacting
     ) {
-      this.enqueueMessage(text, {
-        parts: extraction.hasMedia ? extraction.parts : undefined,
-        imageAttachmentIds: extraction.imageAttachmentIds,
-        videoAttachmentIds: extraction.videoAttachmentIds,
-        mediaSnapshots: extraction.mediaSnapshots,
-        inlineSkillActivations: activations,
-      });
+      this.enqueueMessage(text, enqueueOptions);
       this.updateQueueDisplay();
       this.state.ui.requestRender();
       return;
@@ -1837,14 +1936,14 @@ export class KimiTUI {
     try {
       for (const activation of activations) {
         if (activation.args === undefined) {
-          prepared.skills.push({ name: activation.skillName });
+          prepared.skills.push({ name: activation.skillName, path: activation.path });
           continue;
         }
         const rewrite = rewriteMediaPlaceholders(
           activation.args, this.imageStore, 'plain', mediaSnapshots,
         );
         this.imageStore.retainFileIds(rewrite.videoAttachmentIds);
-        prepared.skills.push({ name: activation.skillName, args: rewrite.text });
+        prepared.skills.push({ name: activation.skillName, path: activation.path, args: rewrite.text });
         prepared.mediaAttachmentIds.push(
           ...new Set([...rewrite.imageAttachmentIds, ...rewrite.videoAttachmentIds]),
         );
@@ -1905,6 +2004,7 @@ export class KimiTUI {
       renderMode: 'plain',
       content: text,
       skillNames: activations.map((activation) => activation.skillName),
+      inlineSkillActivations: activations.length === 0 ? undefined : activations,
       imageAttachmentIds:
         extraction.imageAttachmentIds.length > 0 ? extraction.imageAttachmentIds : undefined,
     };
@@ -1928,7 +2028,7 @@ export class KimiTUI {
             ...extraction.imageAttachmentIds,
             ...extraction.videoAttachmentIds,
           ]);
-          this.restoreInputText(text);
+          this.restoreInputText(text, activations);
         },
       });
       if (recovered) {
@@ -1991,7 +2091,10 @@ export class KimiTUI {
       for (const entry of entries) {
         this.state.editor.addToHistory(entry.content);
       }
-      this.lastHistoryContent = entries.at(-1)?.content;
+      this.inputHistoryEntries = entries.toReversed().filter((entry, index, all) =>
+        index === 0 || !inputHistoryEntryEquals(entry, all[index - 1])
+      ).slice(0, 100);
+      this.lastHistoryEntry = entries.at(-1);
     } catch {
       // best-effort
     }
@@ -2000,15 +2103,64 @@ export class KimiTUI {
   private async persistInputHistory(text: string): Promise<void> {
     const trimmed = text.trim();
     if (trimmed.length === 0) return;
-    if (trimmed === this.lastHistoryContent) return;
+    const activations = text.startsWith('!') ? [] : resolveUserInput({
+      input: trimmed,
+      skillCommandMap: this.skillCommandMap,
+      pluginCommandMap: this.pluginCommandMap,
+      isStreaming: this.state.appState.streamingPhase !== 'idle',
+      isCompacting: this.state.appState.isCompacting,
+      skillVariantPathForCommand: (commandName, start) =>
+        this.skillVariantPathForCommand(commandName, start),
+      defaultSkillPathForCommand: (commandName) => this.defaultSkillPathForCommand(commandName),
+    }).activations;
+    const entry: InputHistoryEntry = {
+      content: trimmed,
+      inlineSkillActivations: activations.length === 0 ? undefined : activations,
+    };
+    if (inputHistoryEntryEquals(entry, this.lastHistoryEntry)) return;
+    if (inputHistoryEntryEquals(entry, this.inputHistoryEntries[0])) this.inputHistoryEntries[0] = entry;
+    else this.inputHistoryEntries.unshift(entry);
+    this.inputHistoryEntries.length = Math.min(this.inputHistoryEntries.length, 100);
     this.state.editor.addToHistory(trimmed);
     try {
       const file = getInputHistoryFile(this.state.appState.workDir);
-      const written = await appendInputHistory(file, trimmed, this.lastHistoryContent);
-      if (written) this.lastHistoryContent = trimmed;
+      const written = await appendInputHistory(file, entry, this.lastHistoryEntry);
+      if (written) this.lastHistoryEntry = entry;
     } catch {
-      this.lastHistoryContent = trimmed;
+      this.lastHistoryEntry = entry;
     }
+  }
+
+  beginInputHistoryRecall(): void {
+    this.inputHistoryRecallIndex = -1;
+    this.inputHistoryDraftVariants = new Map(this.skillVariantPaths);
+  }
+
+  restoreInputHistoryEntry(direction: 1 | -1): void {
+    this.skillVariantPaths.clear();
+    if (this.inputHistoryEntries.length === 0) return;
+    this.inputHistoryRecallIndex = direction === -1
+      ? Math.min(this.inputHistoryRecallIndex + 1, this.inputHistoryEntries.length - 1)
+      : Math.max(this.inputHistoryRecallIndex - 1, 0);
+    const entry = this.inputHistoryEntries[this.inputHistoryRecallIndex];
+    if (entry === undefined) return;
+    for (const { commandName, path, start } of skillVariantPathsForInput(
+      entry.content,
+      entry.inlineSkillActivations ?? [],
+      this.skillCommandMap,
+    )) {
+      this.skillVariantPaths.set(start, { commandName, path });
+    }
+  }
+
+  restoreInputHistoryDraft(): void {
+    this.skillVariantPaths.clear();
+    if (this.inputHistoryDraftVariants !== undefined) {
+      for (const [start, selection] of this.inputHistoryDraftVariants) {
+        this.skillVariantPaths.set(start, selection);
+      }
+    }
+    this.inputHistoryDraftVariants = undefined;
   }
 
   recallLastQueued(): QueuedMessage | undefined {
@@ -2024,6 +2176,11 @@ export class KimiTUI {
         ? [...(last.imageAttachmentIds ?? []), ...(last.videoAttachmentIds ?? [])]
         : [],
     );
+    if (isPromptQueuedMessage(last)) {
+      for (const { commandName, path, start } of skillVariantPathsForInput(last.text, last.inlineSkillActivations ?? [], this.skillCommandMap)) {
+        this.skillVariantPaths.set(start, { commandName, path });
+      }
+    }
     return last;
   }
 
@@ -2077,6 +2234,7 @@ export class KimiTUI {
       mode: undefined,
       mediaSnapshots: options?.mediaSnapshots,
       inlineSkillActivations: options?.inlineSkillActivations,
+      holdUntilTurnEnds: options?.holdUntilTurnEnds,
     };
   }
 
@@ -2113,6 +2271,7 @@ export class KimiTUI {
   }
 
   beginSessionRequest(): void {
+    this.streamingUI.timeline.turnStarted();
     this.cacheHint.onTurnBegin();
     this.streamingUI.setTurnId(undefined);
     this.streamingUI.resetLiveText();
@@ -2131,6 +2290,7 @@ export class KimiTUI {
   }
 
   failSessionRequest(message: string): void {
+    this.streamingUI.timeline.turnEnded();
     this.programStatus.failRequest(message);
     this.setAppState({ streamingPhase: 'idle' });
     this.resetLivePane();
@@ -2249,6 +2409,7 @@ export class KimiTUI {
   }
 
   handleTurnStarted(event: TurnStartedEvent): void {
+    this.promptPredictionController.handleTurnStarted();
     this.staging.handleTurnStarted(event);
     this.surveyController.notifyTurnStarted(event.origin);
     this.programStatus.beginTurn(event.origin);
@@ -2260,6 +2421,10 @@ export class KimiTUI {
     this.programStatus.finishTurn(event);
     this.state.footer.refreshGitStatus();
     if (event.reason === 'completed') void this.maybeAutoGenerateSessionTitle();
+  }
+
+  handlePromptPredictionTurnEnded(event: TurnEndedEvent): void {
+    this.promptPredictionController.handleTurnEnded(event);
   }
 
   private async maybeAutoGenerateSessionTitle(): Promise<void> {
@@ -2487,6 +2652,7 @@ export class KimiTUI {
   }): boolean {
     const { session, error, entries, retried, retry, restore } = args;
     if (this.session?.id !== session.id || !isSessionOccupiedError(error)) return false;
+    this.streamingUI.timeline.turnEnded();
     if (entries !== undefined) this.removeTranscriptEntries(entries);
     this.setAppState({ streamingPhase: 'idle' });
     this.resetLivePane();
@@ -2560,7 +2726,13 @@ export class KimiTUI {
     );
   }
 
-  private sendMessage(session: Session, input: string, options?: SendMessageOptions): void {
+  private sendMessage(
+    session: Session,
+    input: string,
+    options?: SendMessageOptions,
+    delivery: FollowUpDelivery = 'default',
+  ): void {
+    if (delivery === 'steer-draft' && this.trySteerDraft(session, input, options)) return;
     // Submission order must survive a mid-turn compaction: objectives queued
     // while compacting stay queued when the turn outlives the compaction, so
     // steering this input ahead of them would reorder the conversation.
@@ -2568,6 +2740,7 @@ export class KimiTUI {
     // new input; a non-steerable backlog (bash, slash-skill, inline-skill
     // bundle) cannot, and then this input queues behind it instead.
     if (
+      delivery !== 'queue' &&
       this.canSteerQueueIntoRunningTurn() &&
       this.state.queuedMessages.every(isSteerableQueuedMessage)
     ) {
@@ -2589,7 +2762,7 @@ export class KimiTUI {
       // A queued message re-leases its staged media at dequeue dispatch; the
       // pre-dispatch lease defers to the queue item's raw ids.
       this.staging.defer(options?.lease);
-      this.enqueueMessage(input, options);
+      this.enqueueMessage(input, delivery === 'queue' ? { ...options, holdUntilTurnEnds: true } : options);
       return;
     }
     this.sendMessageInternal(session, input, options);
@@ -2612,6 +2785,41 @@ export class KimiTUI {
       !this.deferUserMessages &&
       !this.state.appState.isCompacting
     );
+  }
+
+  private trySteerDraft(
+    session: Session,
+    input: string,
+    options: EnqueueMessageOptions | undefined,
+  ): boolean {
+    if (this.state.queuedMessageDispatchPending || !this.canManuallySteer()) return false;
+    this.staging.defer(options?.lease);
+    const draft = this.toQueuedMessage(input, options);
+    const queuedBefore = new Set(this.state.queuedMessages);
+    this.steeringQueuedMessages.add(draft);
+    this.updateQueueDisplay();
+    this.steerMessage(session, [toSteerInputItem(draft)], (outcome) => {
+      this.steeringQueuedMessages.delete(draft);
+      if (this.session !== session) return;
+      if (outcome === 'steered') this.programStatus.markUserSteer();
+      if (outcome === 'failed') {
+        const queuedLater = this.state.queuedMessages.findIndex((message) => !queuedBefore.has(message));
+        this.state.queuedMessages.splice(
+          queuedLater === -1 ? this.state.queuedMessages.length : queuedLater,
+          0,
+          draft,
+        );
+        this.track('input_queue');
+      }
+      this.updateQueueDisplay();
+      const queuedDuringSteer = this.state.queuedMessages.some((message) => !queuedBefore.has(message));
+      if (outcome === 'steered' && queuedDuringSteer && this.canSteerQueueIntoRunningTurn()) {
+        this.steerQueuedMessagesIntoRunningTurn();
+      } else {
+        this.drainQueueIfIdle();
+      }
+    });
+    return true;
   }
 
   steerQueuedMessagesIntoRunningTurn(manual = false): void {
@@ -2668,7 +2876,8 @@ export class KimiTUI {
           ),
         };
       });
-      this.steerMessage(session, items, (steered) => {
+      this.steerMessage(session, items, (outcome) => {
+        const steered = outcome === 'steered';
         for (const message of group) this.steeringQueuedMessages.delete(message);
         if (this.session !== session) return;
         if (steered) this.programStatus.markUserSteer();
@@ -2851,13 +3060,13 @@ export class KimiTUI {
   steerMessage(
     session: Session,
     input: readonly SteerInputItem[],
-    onSettled?: (steered: boolean) => void,
+    onSettled?: (outcome: SteerOutcome) => void,
     manual = false,
     occupiedRetry = false,
   ): void {
     if (this.deferUserMessages || this.state.appState.isCompacting) {
       if (onSettled !== undefined) {
-        onSettled(false);
+        onSettled('failed');
       } else {
         for (const item of input) this.enqueueMessage(item.text, item);
       }
@@ -2886,7 +3095,7 @@ export class KimiTUI {
     } catch (error) {
       if (prepared !== undefined) this.releaseSkillArgumentMedia(prepared);
       this.showError(`Failed to prepare media attachment: ${formatErrorMessage(error)}`);
-      onSettled?.(false);
+      onSettled?.('failed');
       return;
     }
     const startsNewTurn = this.state.appState.streamingPhase === 'idle';
@@ -2898,6 +3107,7 @@ export class KimiTUI {
       renderMode: 'plain',
       content: item.text,
       skillNames: item.inlineSkillActivations?.map((activation) => activation.skillName),
+      inlineSkillActivations: item.inlineSkillActivations,
       imageAttachmentIds:
         item.imageAttachmentIds !== undefined && item.imageAttachmentIds.length > 0
           ? item.imageAttachmentIds
@@ -2914,12 +3124,10 @@ export class KimiTUI {
       'user',
     );
     const currentTurnId = this.streamingUI.getTurnContext().turnId;
-    // Skill steers may not merge into the current turn: an untracked active
-    // turn (e.g. a goal continuation) has no steerable prompt, so the engine
-    // queues the submission — and binding the lease here would release its
-    // media when that unrelated turn ends. Leave skill leases unclaimed so
-    // the submission's own turn.started claims them; a merged steer simply
-    // retires its media at session close instead.
+    // Skill steers always hand off to the turn that consumes the bundled
+    // entry. Leave skill leases unclaimed by the previous turn so that turn's
+    // completion cannot release the media; the consuming turn.started claims
+    // them instead. Ordinary steers keep the existing binding behavior.
     if (currentTurnId !== undefined && prepared === undefined) this.staging.bindToTurn(stagingLease, currentTurnId);
     const dispatch = (items: readonly SteerInputItem[]) => {
       const payload = combineSteerInput(items);
@@ -2945,7 +3153,7 @@ export class KimiTUI {
     if (onSettled !== undefined) {
       void request.then(
         () => {
-          onSettled(true);
+          onSettled('steered');
         },
         () => {},
       );
@@ -2953,21 +3161,30 @@ export class KimiTUI {
     this.staging.trackDispatch(stagingLease, request, (error) => {
       this.releaseSteerEntries(steeredEntries);
       if (this.session !== session) {
-        onSettled?.(false);
+        onSettled?.('failed');
         return;
       }
       const recovered = this.handlePromptConflict({
         session,
         error,
-        entries: prepared === undefined && !manual ? steeredEntries : undefined,
+        entries: manual ? undefined : steeredEntries,
         retried: occupiedRetry,
         retry: () => {
           this.steerMessage(session, input, onSettled, manual, true);
         },
         restore: () => {
           this.staging.releaseRecalled(mediaAttachmentIds);
-          this.restoreInputText(input.map((item) => item.text).join('\n'));
-          onSettled?.(false);
+          const activations: InlineSkillActivation[] = [];
+          let offset = 0;
+          for (const item of input) {
+            activations.push(...rebaseInlineSkillActivations(item.inlineSkillActivations ?? [], offset));
+            offset += item.text.length + 1;
+          }
+          this.restoreInputText(
+            input.map((item) => item.text).join('\n'),
+            activations.length === 0 ? undefined : activations,
+          );
+          onSettled?.('restored');
         },
       });
       if (recovered) {
@@ -2983,8 +3200,8 @@ export class KimiTUI {
       if (onSettled !== undefined) {
         this.staging.defer(stagingLease);
         if (prepared !== undefined) this.releaseSkillArgumentMedia(prepared);
-        if (prepared === undefined && !manual) this.removeTranscriptEntries(steeredEntries);
-        onSettled(false);
+        if (!manual) this.removeTranscriptEntries(steeredEntries);
+        onSettled('failed');
       }
     });
   }
@@ -3026,6 +3243,7 @@ export class KimiTUI {
 
   pushTranscriptEntry(entry: TranscriptEntry): void {
     this.state.transcriptEntries.push(entry);
+    this.trimTranscriptWindow();
   }
 
   setExternalEditorRunning(running: boolean): void {
@@ -3091,9 +3309,6 @@ export class KimiTUI {
       !sameStringArrays(this.state.appState.additionalDirs, patch.additionalDirs ?? []);
     const busyChanged = 'streamingPhase' in patch || 'isCompacting' in patch;
     Object.assign(this.state.appState, patch);
-    if ('streamingPhase' in patch) {
-      this.state.transcriptContainer.setTurnActive(this.state.appState.streamingPhase !== 'idle');
-    }
     if ('planMode' in patch) this.updateEditorBorderHighlight();
     this.state.footer.setState(this.state.appState);
     this.updateActivityPane();
@@ -3520,6 +3735,7 @@ export class KimiTUI {
         },
         () => this.resolveApprovalEnvironment(),
         this.programStatus,
+        this.streamingUI.timeline,
       ),
     );
     session.setQuestionHandler(
@@ -3637,6 +3853,7 @@ export class KimiTUI {
   resetSessionRuntime(options?: { readonly keepQueuedMessages?: boolean }): void {
     this.aborted = false;
     this.cacheHint.resetRuntime();
+    this.promptPredictionController.reset();
     this.surveyController.reset();
     this.streamingUI.discardPending();
     this.resetSteerDeliveries();
@@ -4000,12 +4217,14 @@ export class KimiTUI {
     const entries = this.state.transcriptEntries;
     const entryIndex = entries.indexOf(entry);
     if (entryIndex < 0) return false;
+    entry.turnId = this.streamingUI.getTurnContext().turnId;
     entries.splice(entryIndex, 1);
     entries.push(entry);
     const component = this.state.transcriptContainer.children.find(
       (child) => getTranscriptComponentEntry(child) === entry,
     );
     if (component !== undefined) this.state.transcriptContainer.moveChildToEnd(component);
+    this.trimTranscriptWindow();
     this.state.ui.requestRender();
     return true;
   }
@@ -4088,6 +4307,7 @@ export class KimiTUI {
     this.sessionEventHandler.stopAllMcpServerStatusSpinners();
     this.disposeTranscriptChildren();
     this.state.transcriptContainer.clear();
+    this.streamingUI.timeline.reset();
     this.btwPanelController.clear();
     this.clearTerminalInlineImages();
     this.sessionEventHandler.notifications.clear();
@@ -4125,15 +4345,6 @@ export class KimiTUI {
     if (this.state.appState.isReplaying) return false;
 
     const children = this.state.transcriptContainer.children;
-
-    // Trim whole turns by *position* in the child list rather than by entry
-    // lookup — otherwise only the (registered) user message would be removed and
-    // the rest of the turn would be left behind.
-    const boundaries: number[] = [];
-    for (let i = 0; i < children.length; i++) {
-      if (isTurnBoundaryComponent(children[i]!)) boundaries.push(i);
-    }
-
     const turns = groupTurns(this.state.transcriptEntries);
 
     const toRemove = turnsToTrim(turns, TRANSCRIPT_MAX_TURNS, TRANSCRIPT_HYSTERESIS);
@@ -4149,46 +4360,45 @@ export class KimiTUI {
       }
     }
 
-    let boundariesToRemove = 0;
-    for (const entry of toRemove) {
-      if (
-        (entry.kind === 'user' ||
-          entry.kind === 'skill_activation' ||
-          entry.kind === 'plugin_command') &&
-        entry.turnId === undefined
-      ) {
-        boundariesToRemove++;
+    const retainedTurnIds = new Set<string>();
+    const trimmedTurnIds = new Set<string>();
+    for (const turn of turns) {
+      if (turn.turnId === undefined) continue;
+      if (turn.entries.some((entry) => toRemove.has(entry))) {
+        trimmedTurnIds.add(turn.turnId);
+      } else {
+        retainedTurnIds.add(turn.turnId);
       }
     }
-    if (boundariesToRemove === 0) {
-      this.state.transcriptEntries = this.state.transcriptEntries.filter((e) => !toRemove.has(e));
-      return true;
-    }
+    for (const turnId of retainedTurnIds) trimmedTurnIds.delete(turnId);
 
-    let boundariesSeen = 0;
-    let cutoff = 0;
-    for (let i = 0; i < children.length; i++) {
-      if (isTurnBoundaryComponent(children[i]!)) {
-        if (boundariesSeen === boundariesToRemove) {
-          cutoff = i;
-          break;
-        }
-        boundariesSeen++;
+    const firstRetainedIndex = children.findIndex((child) => {
+      const entry = getTranscriptComponentEntry(child);
+      if (entry !== undefined) return !toRemove.has(entry);
+      const turnId = getTranscriptComponentTurnId(child);
+      return turnId !== undefined && retainedTurnIds.has(turnId);
+    });
+    const unmarkedCutoff = firstRetainedIndex < 0 ? children.length : firstRetainedIndex;
+    const componentsToRemove = children.filter((child, index) => {
+      if (child instanceof WelcomeComponent) return false;
+      const entry = getTranscriptComponentEntry(child);
+      if (entry !== undefined) return toRemove.has(entry);
+      const turnId = getTranscriptComponentTurnId(child);
+      if (turnId !== undefined) {
+        if (retainedTurnIds.has(turnId)) return false;
+        if (trimmedTurnIds.has(turnId)) return true;
       }
-    }
-
-    const componentsToRemove: Component[] = [];
-    for (let i = 0; i < cutoff; i++) {
-      const child = children[i]!;
-      if (child instanceof WelcomeComponent) continue;
-      componentsToRemove.push(child);
-    }
+      return index < unmarkedCutoff;
+    });
     for (const child of componentsToRemove) {
       // pi-tui Container.removeChild (not a DOM node); `child.remove()` does not exist.
       // oxlint-disable-next-line unicorn/prefer-dom-node-remove
       this.state.transcriptContainer.removeChild(child);
       if (hasDispose(child)) child.dispose();
     }
+    this.streamingUI.timeline.forget(
+      componentsToRemove.flatMap((child) => (child instanceof ToolCallComponent ? [child.toolCallView.id] : [])),
+    );
 
     this.state.transcriptEntries = this.state.transcriptEntries.filter((e) => !toRemove.has(e));
     return true;
@@ -4243,7 +4453,7 @@ export class KimiTUI {
         assistantIndices.push(i);
         continue;
       }
-      stepIndices.push(i);
+      if (!isPinnedToolCallComponent(child)) stepIndices.push(i);
     }
 
     // Fold the oldest steps / assistant messages beyond their respective caps;
@@ -4277,6 +4487,10 @@ export class KimiTUI {
       summary = new StepSummaryComponent();
       summary.addCounts(thinkingCount, toolCount, assistantMergeCount);
     }
+    markTranscriptComponentTurnId(
+      summary,
+      this.streamingUI.getTurnContext().turnId ?? getTranscriptComponentTurnId(children[turnStart]!),
+    );
 
     // Rebuild children: keep everything except the merged steps, with the summary
     // sitting right after the user message.
@@ -4326,7 +4540,7 @@ export class KimiTUI {
         const child = children[i]!;
         if (child instanceof StepSummaryComponent) summaryIndex = i;
         else if (child instanceof AssistantMessageComponent) assistantIndices.push(i);
-        else stepIndices.push(i);
+        else if (!isPinnedToolCallComponent(child)) stepIndices.push(i);
       }
 
       const stepMergeCount =
@@ -4359,6 +4573,7 @@ export class KimiTUI {
           summary = new StepSummaryComponent();
           summary.addCounts(thinkingCount, toolCount, assistantMergeCount);
         }
+        markTranscriptComponentTurnId(summary, getTranscriptComponentTurnId(children[turnStart]!));
         newChildren.push(summary);
         for (const idx of toMergeIndices) toDispose.push(children[idx]!);
         const toMergeSet = new Set(toMergeIndices);
@@ -4509,6 +4724,8 @@ export class KimiTUI {
 
     this.lastActivityMode = activityModeKey;
     this.state.activityContainer.clear();
+    const { timeline } = this.streamingUI;
+    const working: SpinnerLabel = (now) => workingLabel(timeline.turn(), instant(now));
 
     switch (effectiveMode) {
       case 'hidden':
@@ -4546,7 +4763,7 @@ export class KimiTUI {
         break;
       }
       case 'thinking': {
-        const spinner = this.ensureActivitySpinner('braille', 'Working…', (s) =>
+        const spinner = this.ensureActivitySpinner('braille', working, (s) =>
           currentTheme.fg('primary', s),
         );
         this.syncAgentSwarmActivitySpinner(undefined);
@@ -4560,7 +4777,7 @@ export class KimiTUI {
         break;
       }
       case 'composing': {
-        const spinner = this.ensureActivitySpinner('braille', 'Working…', (s) =>
+        const spinner = this.ensureActivitySpinner('braille', working, (s) =>
           currentTheme.fg('primary', s),
         );
         this.syncAgentSwarmActivitySpinner(undefined);
@@ -4590,10 +4807,8 @@ export class KimiTUI {
       case 'session': {
         this.stopActivitySpinner();
         this.syncAgentSwarmActivitySpinner(undefined);
-        // Working modes occupy two rows (a spacer above the loader); idle
-        // keeps a one-row placeholder so the dock only shifts once at turn
-        // boundaries instead of on every intra-turn mode flip.
         this.state.activityContainer.addChild(new Spacer(1));
+        this.state.activityContainer.addChild(new LastTurnSummary(timeline));
         break;
       }
     }
@@ -4629,6 +4844,7 @@ export class KimiTUI {
 
   updateQueueDisplay(): void {
     this.programStatus?.refresh();
+    this.promptPredictionController.handleQueueChange();
     const { queueContainer, queuePane, queuedMessages } = this.state;
     if (queuedMessages.length === 0) {
       queuePane.scrollBodyToTop();
@@ -4871,7 +5087,7 @@ export class KimiTUI {
 
   private ensureActivitySpinner(
     style: SpinnerStyle,
-    label = '',
+    label: SpinnerLabel = '',
     colorFn?: (s: string) => string,
   ): MoonLoader {
     if (this.state.activitySpinner?.style !== style) {
@@ -4940,6 +5156,7 @@ export class KimiTUI {
     this.editorReplacementOnDisplaced = onDisplaced;
     this.editorReplacementOnReplaced = onReplaced;
     this.editorReplacementOwner = owner;
+    this.promptPredictionController.notifyDisplaced();
     this.surveyController.notifyDisplaced();
     if (this.state.activeDialog === 'model-switch-confirm') this.state.activeDialog = null;
     this.disposeEditorReplacement();
@@ -4976,8 +5193,12 @@ export class KimiTUI {
     if (panel !== undefined && hasDispose(panel)) panel.dispose();
   }
 
-  restoreInputText(text: string): void {
+  restoreInputText(text: string, inlineSkillActivations?: readonly InlineSkillActivation[]): void {
+    this.skillVariantPaths.clear();
     this.restoreEditor();
+    for (const { commandName, path, start } of skillVariantPathsForInput(text, inlineSkillActivations ?? [], this.skillCommandMap)) {
+      this.skillVariantPaths.set(start, { commandName, path });
+    }
     this.state.editor.setText(text);
     this.updateEditorBorderHighlight(text);
     this.state.ui.requestRender();
@@ -5098,6 +5319,10 @@ export class KimiTUI {
     this.mountEditorReplacement(
       new HelpPanelComponent({
         commands: this.getSlashCommands(),
+        shortcuts: keyboardShortcuts(
+          resolveFollowUpBehavior(this.state.appState.followUpBehavior),
+          isKittyProtocolActive(),
+        ),
         onClose: () => {
           this.hideHelpPanel();
         },
@@ -5448,7 +5673,11 @@ export class KimiTUI {
 }
 
 function isSteerableQueuedMessage(message: QueuedMessage): message is QueuedPromptMessage {
-  return isPromptQueuedMessage(message) && message.inlineSkillActivations === undefined;
+  return (
+    isPromptQueuedMessage(message) &&
+    message.inlineSkillActivations === undefined &&
+    message.holdUntilTurnEnds !== true
+  );
 }
 
 function toSteerInputItem(message: QueuedPromptMessage): SteerInputItem {

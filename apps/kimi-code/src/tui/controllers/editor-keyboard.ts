@@ -18,7 +18,9 @@ import {
   EXIT_CONFIRM_WINDOW_MS,
   LLM_NOT_SET_MESSAGE,
 } from '../constant/kimi-tui';
-import { Key, matchesKey } from '@moonshot-ai/pi-tui';
+import { isKeyRelease, isKeyRepeat, Key, matchesKey, TuiAltScreen } from '@moonshot-ai/pi-tui';
+import { normalizeCapsLockedCtrl } from '../components/editor/custom-editor';
+import { FOLLOW_UP_KEYMAP, resolveFollowUpBehavior, type FollowUpDelivery } from '../config';
 import { MEDIA_STAGING_TTL_SECONDS } from '../constant/media';
 import { formatErrorMessage } from '../utils/event-payload';
 import type {
@@ -45,12 +47,19 @@ export interface EditorKeyboardHost {
    */
   harness?: KimiHarness | undefined;
 
-  handleUserInput(text: string): void;
+  handleUserInput(text: string, delivery?: FollowUpDelivery): void;
   readonly btwPanelController: BtwPanelController;
   readonly surveyController: SurveyController;
   readonly modelMigration?: ModelMigrationController;
+  readonly promptPredictionController?: import('./prompt-prediction').PromptPredictionController;
   readonly skillCommandMap: Map<string, string>;
   readonly pluginCommandMap: Map<string, string>;
+  readonly skillVariantPathForCommand?: (commandName: string, tokenStart: number) => string | undefined;
+  readonly defaultSkillPathForCommand?: (commandName: string) => string | undefined;
+  retainSkillVariantSelection?(text: string): void;
+  beginInputHistoryRecall?(): void;
+  restoreInputHistoryEntry?(direction: 1 | -1): void;
+  restoreInputHistoryDraft?(): void;
   steerQueuedMessagesIntoRunningTurn(manual?: boolean): void;
   validateMediaCapabilities(extraction: {
     hasMedia: boolean;
@@ -83,7 +92,11 @@ export interface EditorKeyboardHost {
   updateActivityPane(): void;
 }
 
+const SELECTION_COPY_KEYS = [Key.ctrl('c'), Key.ctrlShift('c'), Key.super('c')];
+
 export class EditorKeyboardController {
+  private disposeSelectionCopy: (() => void) | undefined;
+  private copyKeyHeld = false;
   private pendingExit: PendingExit | null = null;
   private pendingUndoEsc: { readonly timer: ReturnType<typeof setTimeout> } | null = null;
   private disposed = false;
@@ -99,7 +112,9 @@ export class EditorKeyboardController {
 
     editor.onSubmit = (text: string) => {
       if (host.surveyController.handleSubmit(text)) return;
-      host.handleUserInput(text);
+      host.promptPredictionController?.handleSubmit(text);
+      const behavior = resolveFollowUpBehavior(host.state.appState.followUpBehavior);
+      host.handleUserInput(text, FOLLOW_UP_KEYMAP[behavior][editor.submitKey]);
     };
 
     // After dispose (shutdown), consume every key here so no shortcut can fire
@@ -108,14 +123,23 @@ export class EditorKeyboardController {
     editor.onPreInput = (data: string) => {
       if (this.disposed) return true;
       if (matchesKey(data, Key.escape)) this.clearPendingExit();
-      const consumed = host.surveyController.handlePreInput(data);
-      if (consumed) this.clearPendingUndoEsc();
-      return consumed;
+      if (host.surveyController.handlePreInput(data)) {
+        this.clearPendingUndoEsc();
+        return true;
+      }
+      if (host.promptPredictionController?.handlePreInput(data) === true) {
+        this.clearPendingUndoEsc();
+        return true;
+      }
+      return false;
     };
 
     editor.onChange = (text: string) => {
       if (this.pendingExit) this.clearPendingExit();
+      host.promptPredictionController?.handleEditorChange(text);
       host.surveyController.handleEditorChange(text);
+      if (text === '') queueMicrotask(() => host.retainSkillVariantSelection?.(editor.getText()));
+      else host.retainSkillVariantSelection?.(text);
       host.updateEditorBorderHighlight(text);
       if (text.length === 0) host.modelMigration?.retry();
       // Expanding paste markers costs a full-text pass, and only `/goal`
@@ -152,7 +176,8 @@ export class EditorKeyboardController {
     // mode; recalling a plain entry returns to prompt mode. The filter above
     // guarantees bash mode only ever lands on `!` entries, so this never
     // misfires on commands typed in bash mode.
-    editor.onRecall = (entry: string) => {
+    editor.onRecall = (entry: string, direction: 1 | -1) => {
+      host.restoreInputHistoryEntry?.(direction);
       if (entry.startsWith('!')) {
         editor.setInputMode('bash');
         return entry.slice(1);
@@ -167,10 +192,12 @@ export class EditorKeyboardController {
     // message would be submitted as a shell command. Also locks the history
     // filter (browseMode) for the duration of the browse session.
     editor.onHistoryDraftSave = () => {
+      host.beginInputHistoryRecall?.();
       browseMode = editor.inputMode;
       return editor.inputMode;
     };
     editor.onHistoryDraftRestore = (state: unknown) => {
+      host.restoreInputHistoryDraft?.();
       editor.setInputMode(state as 'prompt' | 'bash');
       browseMode = null;
     };
@@ -350,6 +377,12 @@ export class EditorKeyboardController {
           pluginCommandMap: host.pluginCommandMap,
           isStreaming: true,
           isCompacting: host.state.appState.isCompacting,
+          skillVariantPathForCommand: host.skillVariantPathForCommand === undefined
+            ? undefined
+            : (commandName, tokenStart) => host.skillVariantPathForCommand!(commandName, tokenStart),
+          defaultSkillPathForCommand: host.defaultSkillPathForCommand === undefined
+            ? undefined
+            : (commandName) => host.defaultSkillPathForCommand!(commandName),
         });
         host.state.queuedMessages.push({
           text,
@@ -378,6 +411,12 @@ export class EditorKeyboardController {
       host.detachCurrentForegroundTask();
       return true;
     };
+
+    const { ui } = host.state;
+    if (ui instanceof TuiAltScreen) {
+      // A UI-level listener sees the key before any focused dialog does.
+      this.disposeSelectionCopy = ui.addInputListener((data) => this.handleSelectionCopyKey(ui, data));
+    }
 
     editor.onUndo = () => {
       host.track('undo');
@@ -423,8 +462,31 @@ export class EditorKeyboardController {
 
   dispose(): void {
     this.disposed = true;
+    this.disposeSelectionCopy?.();
     this.clearPendingExit();
     this.clearPendingUndoEsc();
+  }
+
+  private handleSelectionCopyKey(ui: TuiAltScreen, data: string): { consume: true } | undefined {
+    const key = normalizeCapsLockedCtrl(data);
+    if (!SELECTION_COPY_KEYS.some((copyKey) => matchesKey(key, copyKey))) return undefined;
+    if (isKeyRelease(key)) {
+      this.copyKeyHeld = false;
+      return undefined;
+    }
+    // Holding the key that copied must not turn its auto-repeat into an interrupt.
+    if (isKeyRepeat(key)) return this.copyKeyHeld ? { consume: true } : undefined;
+    this.copyKeyHeld = false;
+    if (!ui.hasActiveSelection()) return undefined;
+    this.clearPendingExit();
+    this.clearPendingUndoEsc();
+    // The copy reads the selection before its first await, so clearing it
+    // right away is safe and leaves the next Ctrl+C free to interrupt.
+    void ui.copyActiveSelectionToClipboard();
+    ui.resetTextSelection();
+    ui.requestRender();
+    this.copyKeyHeld = true;
+    return { consume: true };
   }
 
   private armPendingUndoEsc(): void {

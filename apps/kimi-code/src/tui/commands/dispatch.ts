@@ -13,6 +13,7 @@ import type { ModelMigrationController } from '../controllers/model-migration';
 import type { StreamingUIController } from '../controllers/streaming-ui';
 import type { TasksBrowserController } from '../controllers/tasks-browser';
 import { tryHandleDanceCommand } from '../easter-eggs/dance';
+import type { FollowUpDelivery } from '../config';
 import type { ResolvedTheme } from '../theme/colors';
 import type { TUIState } from '../tui-state';
 import type {
@@ -24,6 +25,7 @@ import type {
   TranscriptEntry,
 } from '../types';
 import { formatErrorMessage } from '../utils/event-payload';
+import type { ExtractionResult } from '../utils/image-placeholder';
 import { handleLoginCommand, handleLogoutCommand } from './auth';
 import { handleBtwCommand } from './btw';
 import { handleCopyCommand } from './copy';
@@ -137,7 +139,7 @@ export interface SlashCommandHost {
     owner?: ReverseRpcModalOwner,
   ): void;
   restoreEditor(): void;
-  restoreInputText(text: string): void;
+  restoreInputText(text: string, inlineSkillActivations?: readonly InlineSkillActivation[]): void;
   refreshSlashCommandAutocomplete(): void;
   /**
    * Rebuild the plugin slash-command list. With no session (v2 session-less
@@ -210,13 +212,18 @@ export interface SlashCommandHost {
   showHelpPanel(): void;
   createNewSession(): Promise<void>;
   showSessionPicker(): Promise<void>;
-  sendNormalUserInput(text: string): void;
+  sendNormalUserInput(text: string, preExtracted?: ExtractionResult, delivery?: FollowUpDelivery): void;
   /**
    * Submit a prompt that explicitly activates one or more skills inline
    * (v2 engine only): all activations ride the same submission as the prompt
    * and launch as a single turn.
    */
-  sendInlineSkillUserInput(text: string, activations: readonly InlineSkillActivation[]): Promise<void>;
+  sendInlineSkillUserInput(
+    text: string,
+    activations: readonly InlineSkillActivation[],
+    preExtracted?: ExtractionResult,
+    delivery?: FollowUpDelivery,
+  ): Promise<void>;
   activatePluginCommand(
     session: Session,
     pluginId: string,
@@ -225,6 +232,8 @@ export interface SlashCommandHost {
   ): void;
   readonly skillCommandMap: Map<string, string>;
   readonly pluginCommandMap: Map<string, string>;
+  readonly skillVariantPathForCommand?: (commandName: string, tokenStart: number) => string | undefined;
+  readonly defaultSkillPathForCommand?: (commandName: string) => string | undefined;
 
   // Controller refs
   readonly streamingUI: StreamingUIController;
@@ -238,15 +247,25 @@ export interface SlashCommandHost {
 // Dispatch — entry point from handleUserInput
 // ---------------------------------------------------------------------------
 
-export function dispatchInput(host: SlashCommandHost, text: string): void {
+export function dispatchInput(
+  host: SlashCommandHost,
+  text: string,
+  delivery: FollowUpDelivery = 'default',
+): void {
   const { intent, activations } = resolveUserInput({
     input: text,
     skillCommandMap: host.skillCommandMap,
     pluginCommandMap: host.pluginCommandMap,
     isStreaming: host.state.appState.streamingPhase !== 'idle',
     isCompacting: host.state.appState.isCompacting,
+    skillVariantPathForCommand: host.skillVariantPathForCommand === undefined
+      ? undefined
+      : (commandName, tokenStart) => host.skillVariantPathForCommand!(commandName, tokenStart),
+    defaultSkillPathForCommand: host.defaultSkillPathForCommand === undefined
+      ? undefined
+      : (commandName) => host.defaultSkillPathForCommand!(commandName),
   });
-  if (intent.kind === 'skill' || activations.length > 0) {
+  if (intent.kind === 'skill' || (activations.length > 0 && intent.kind !== 'builtin')) {
     const leading = activations[0];
     if (intent.kind === 'skill' && leading?.args !== undefined && host.state.appState.model.trim().length > 0) {
       host.track('input_command', {
@@ -254,20 +273,22 @@ export function dispatchInput(host: SlashCommandHost, text: string): void {
         skill_name: leading.skillName,
       });
     }
-    void host.sendInlineSkillUserInput(text, activations);
+    void host.sendInlineSkillUserInput(text, activations, undefined, delivery);
     return;
   }
   if (intent.kind !== 'not-command') {
-    void executeSlashCommand(host, text, intent);
+    void executeSlashCommand(host, text, intent, activations, delivery);
     return;
   }
-  host.sendNormalUserInput(text);
+  host.sendNormalUserInput(text, undefined, delivery);
 }
 
 async function executeSlashCommand(
   host: SlashCommandHost,
   input: string,
   intent: Exclude<SlashCommandIntent, { readonly kind: 'skill' | 'not-command' }>,
+  activations: readonly InlineSkillActivation[],
+  delivery: FollowUpDelivery,
 ): Promise<void> {
   const parsedCommand = parseSlashInput(input);
 
@@ -315,7 +336,7 @@ async function executeSlashCommand(
       if (parsedCommand !== null && tryHandleDanceCommand(host, parsedCommand)) {
         return;
       }
-      host.sendNormalUserInput(intent.input);
+      host.sendNormalUserInput(intent.input, undefined, delivery);
       return;
     case 'builtin':
       if (intent.enqueue === true) {
@@ -333,7 +354,7 @@ async function executeSlashCommand(
         host.track('clear');
       }
       try {
-        await handleBuiltInSlashCommand(host, intent.name, intent.args, input);
+        await handleBuiltInSlashCommand(host, intent.name, intent.args, input, activations);
       } catch (error) {
         host.showError(formatErrorMessage(error));
       }
@@ -370,13 +391,14 @@ async function handleBuiltInSlashCommand(
   name: BuiltinSlashCommandName,
   args: string,
   input: string,
+  activations: readonly InlineSkillActivation[],
 ): Promise<void> {
   if (host.session === undefined && SESSION_REQUIRING_COMMANDS.has(name)) {
     const session = await ensureSessionForCommand(host);
     if (session === undefined) {
       // Creation failed after submit cleared the buffer; give the input
       // back unless the user moved on — a newer draft or an opened panel.
-      if (canRestoreSubmittedInput(host)) host.restoreInputText(input);
+      if (canRestoreSubmittedInput(host)) host.restoreInputText(input, activations);
       return;
     }
     // A first prompt may have started a turn while the session was being
@@ -503,7 +525,7 @@ async function handleBuiltInSlashCommand(
       await handleFeedbackCommand(host);
       return;
     case 'btw':
-      await handleBtwCommand(host, args);
+      await handleBtwCommand(host, args, activations);
       return;
     case 'title':
       await handleTitleCommand(host, args);

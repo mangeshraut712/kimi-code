@@ -70,6 +70,7 @@ export interface SessionReplayHost {
   readonly sessionEventHandler: SessionEventHandler;
   setAppState(patch: Partial<AppState>): void;
   showError(msg: string): void;
+  showStatus?(message: string, color?: 'warning'): void;
   appendTranscriptEntry(entry: TranscriptEntry): void;
   mergeAllTurnSteps(): void;
   restoreProgramStatusBackground?(tasks: readonly BackgroundTaskInfo[]): void;
@@ -128,6 +129,13 @@ export class SessionReplayRenderer {
       if (main === undefined) {
         this.host.showError('Session history is unavailable for this session.');
         return false;
+      }
+      if (main.replayError !== undefined) {
+        this.host.showError(`Failed to replay session history: ${main.replayError}`);
+        return false;
+      }
+      if (main.replayWarning !== undefined) {
+        this.host.showStatus?.(`Warning: ${main.replayWarning}`, 'warning');
       }
 
       this.hydrateSnapshot(main);
@@ -457,6 +465,10 @@ export class SessionReplayRenderer {
         'plain',
       ),
       skillNames: bundledSkillsFromOrigin(message.origin).map((skill) => skill.skillName),
+      inlineSkillActivations: bundledSkillsFromOrigin(message.origin).map((skill) => ({
+        skillName: skill.skillName,
+        path: skill.skillPath,
+      })),
     });
   }
 
@@ -566,6 +578,7 @@ export class SessionReplayRenderer {
     this.host.appendTranscriptEntry({
       ...replayEntry(context, 'user', userSlashSkillPromptText(message, skill), 'plain'),
       skillNames: [skill.skillName],
+      inlineSkillActivations: [{ skillName: skill.skillName, path: skill.skillPath }],
       skillActivationId: skill.activationId,
       skillName: skill.skillName,
       skillArgs: skill.skillArgs,
