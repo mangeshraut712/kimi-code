@@ -20,6 +20,7 @@ import {
 } from '../constant/kimi-tui';
 import { isKeyRelease, isKeyRepeat, Key, matchesKey, TuiAltScreen } from '@moonshot-ai/pi-tui';
 import { normalizeCapsLockedCtrl } from '../components/editor/custom-editor';
+import { FOLLOW_UP_KEYMAP, resolveFollowUpBehavior, type FollowUpDelivery } from '../config';
 import { MEDIA_STAGING_TTL_SECONDS } from '../constant/media';
 import { formatErrorMessage } from '../utils/event-payload';
 import type {
@@ -46,10 +47,11 @@ export interface EditorKeyboardHost {
    */
   harness?: KimiHarness | undefined;
 
-  handleUserInput(text: string): void;
+  handleUserInput(text: string, delivery?: FollowUpDelivery): void;
   readonly btwPanelController: BtwPanelController;
   readonly surveyController: SurveyController;
   readonly modelMigration?: ModelMigrationController;
+  readonly promptPredictionController?: import('./prompt-prediction').PromptPredictionController;
   readonly skillCommandMap: Map<string, string>;
   readonly pluginCommandMap: Map<string, string>;
   readonly skillVariantPathForCommand?: (commandName: string, tokenStart: number) => string | undefined;
@@ -110,7 +112,9 @@ export class EditorKeyboardController {
 
     editor.onSubmit = (text: string) => {
       if (host.surveyController.handleSubmit(text)) return;
-      host.handleUserInput(text);
+      host.promptPredictionController?.handleSubmit(text);
+      const behavior = resolveFollowUpBehavior(host.state.appState.followUpBehavior);
+      host.handleUserInput(text, FOLLOW_UP_KEYMAP[behavior][editor.submitKey]);
     };
 
     // After dispose (shutdown), consume every key here so no shortcut can fire
@@ -119,13 +123,20 @@ export class EditorKeyboardController {
     editor.onPreInput = (data: string) => {
       if (this.disposed) return true;
       if (matchesKey(data, Key.escape)) this.clearPendingExit();
-      const consumed = host.surveyController.handlePreInput(data);
-      if (consumed) this.clearPendingUndoEsc();
-      return consumed;
+      if (host.surveyController.handlePreInput(data)) {
+        this.clearPendingUndoEsc();
+        return true;
+      }
+      if (host.promptPredictionController?.handlePreInput(data) === true) {
+        this.clearPendingUndoEsc();
+        return true;
+      }
+      return false;
     };
 
     editor.onChange = (text: string) => {
       if (this.pendingExit) this.clearPendingExit();
+      host.promptPredictionController?.handleEditorChange(text);
       host.surveyController.handleEditorChange(text);
       if (text === '') queueMicrotask(() => host.retainSkillVariantSelection?.(editor.getText()));
       else host.retainSkillVariantSelection?.(text);

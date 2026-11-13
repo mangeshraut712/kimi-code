@@ -10,11 +10,13 @@ import {
   matchesKey,
   Key,
   SelectList,
+  truncateToWidth,
   visibleWidth,
   type SelectItem,
   type TUI,
 } from '@moonshot-ai/pi-tui';
 
+import type { SubmitKey } from '#/tui/config';
 import { currentTheme } from '#/tui/theme';
 import { createEditorTheme } from '#/tui/theme/pi-tui-theme';
 import { printableChar } from '#/tui/utils/printable-key';
@@ -116,6 +118,12 @@ function stripSgr(s: string): string {
   return s.replace(ANSI_SGR, '');
 }
 
+function alternateSubmitKey(data: string): Exclude<SubmitKey, 'enter'> | undefined {
+  if (matchesKey(data, 'ctrl+enter') || matchesKey(data, 'super+enter')) return 'mod-enter';
+  if (matchesKey(data, Key.ctrl('q'))) return 'ctrl-q';
+  return undefined;
+}
+
 interface CustomEditorOptions {
   disablePasteBurst?: boolean;
 }
@@ -175,6 +183,12 @@ export class CustomEditor extends Editor {
   private readonly pasteInputQueue: string[] = [];
   private argumentHints: ReadonlyMap<string, string> = new Map();
   private skillCommandNames: ReadonlySet<string> = new Set();
+  private promptPrediction: string | undefined;
+  private currentSubmitKey: SubmitKey = 'enter';
+
+  get submitKey(): SubmitKey {
+    return this.currentSubmitKey;
+  }
 
   setArgumentHints(hints: ReadonlyMap<string, string>): void {
     this.argumentHints = hints;
@@ -182,6 +196,22 @@ export class CustomEditor extends Editor {
 
   setSkillCommandNames(names: ReadonlySet<string>): void {
     this.skillCommandNames = names;
+  }
+
+  setPromptPrediction(text: string | undefined): void {
+    this.promptPrediction = text;
+  }
+
+  getPromptPrediction(): string | undefined {
+    return this.promptPrediction;
+  }
+
+  acceptPromptPrediction(): boolean {
+    const text = this.promptPrediction;
+    if (text === undefined || this.getText().length > 0) return false;
+    this.promptPrediction = undefined;
+    this.setText(text);
+    return true;
   }
 
   constructor(tui: TUI, options: CustomEditorOptions = {}) {
@@ -327,6 +357,17 @@ export class CustomEditor extends Editor {
       const line = lines[firstContentIdx];
       if (line !== undefined) {
         lines[firstContentIdx] = injectArgumentHint(line, hint, this.getText().length, width);
+      }
+    }
+    if (
+      this.promptPrediction !== undefined &&
+      this.inputMode === 'prompt' &&
+      this.getText().length === 0 &&
+      !this.hasAutocompleteActivity()
+    ) {
+      const line = lines[firstContentIdx];
+      if (line !== undefined) {
+        lines[firstContentIdx] = injectPromptPrediction(line, this.promptPrediction, width);
       }
     }
     const firstContent = lines[firstContentIdx];
@@ -571,7 +612,17 @@ export class CustomEditor extends Editor {
     }
 
     const emptyPromptBeforeInput = this.inputMode === 'prompt' && this.getText().length === 0;
-    super.handleInput(normalized);
+    const submitKey = alternateSubmitKey(normalized);
+    if (submitKey === undefined) {
+      super.handleInput(normalized);
+    } else {
+      this.currentSubmitKey = submitKey;
+      try {
+        super.handleInput('\r');
+      } finally {
+        this.currentSubmitKey = 'enter';
+      }
+    }
 
     // Enter bash mode when `!...` is pasted into an empty prompt. The typed path
     // above handles the single `!` keystroke; this catches bracketed / Ctrl-V
@@ -805,6 +856,23 @@ function truncateHint(hint: string, maxLen: number): string {
   if (hint.length <= maxLen) return hint;
   if (maxLen === 1) return '…';
   return `${hint.slice(0, maxLen - 1)}…`;
+}
+
+function injectPromptPrediction(line: string, prediction: string, width: number): string {
+  const cursorIdx = line.indexOf(CURSOR_BLOCK);
+  const cursorPresent = cursorIdx !== -1;
+  const contentWidth = Math.max(1, width - EDITOR_LEFT_PADDING * 2);
+  const available = contentWidth - (cursorPresent ? 1 : 0);
+  if (available <= 0) return line;
+  const preview = prediction.replaceAll(/\s+/g, ' ').trim();
+  const trimmed = truncateToWidth(preview, available, '…');
+  if (trimmed.length === 0) return line;
+  const insertAt = cursorPresent
+    ? cursorIdx + CURSOR_BLOCK.length
+    : mapVisibleIdxToRaw(line, EDITOR_LEFT_PADDING);
+  const trailing = line.slice(insertAt);
+  const remaining = Math.max(0, visibleWidth(trailing) - visibleWidth(trimmed));
+  return line.slice(0, insertAt) + currentTheme.fg('textMuted', trimmed) + ' '.repeat(remaining);
 }
 
 /**

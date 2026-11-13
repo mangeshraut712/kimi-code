@@ -19,7 +19,6 @@ import {
   IAgentGoalService,
   IAgentLoopService,
   IAgentPermissionModeService,
-  IAgentProfileService,
   IAgentScopeContext,
   IAgentTaskService,
   IAgentTodoService,
@@ -39,7 +38,7 @@ import {
   interactions,
   makeAgentScopeContext,
 } from '@moonshot-ai/agent-core-v2';
-import { Event2 } from '@moonshot-ai/agent-core-v2/app/event/event2';
+import type { Event2Class } from '@moonshot-ai/agent-core-v2/app/event/event2';
 import {
   AgentEventBusView,
   EventBusService,
@@ -74,9 +73,9 @@ class FakeAgentBus {
   private allHandlers: Array<(e: FakeBusEvent) => void> = [];
   private perType = new Map<string, Array<(e: FakeBusEvent) => void>>();
   subscribe(handler: (e: FakeBusEvent) => void): { dispose(): void };
-  subscribe(type: string, handler: (e: FakeBusEvent) => void): { dispose(): void };
-  subscribe(typeOrHandler: string | ((e: FakeBusEvent) => void), handler?: (e: FakeBusEvent) => void) {
-    if (typeof typeOrHandler === 'function') {
+  subscribe(type: string | Event2Class, handler: (e: FakeBusEvent) => void): { dispose(): void };
+  subscribe(typeOrHandler: string | Event2Class | ((e: FakeBusEvent) => void), handler?: (e: FakeBusEvent) => void) {
+    if (typeof typeOrHandler === 'function' && !('type' in typeOrHandler)) {
       this.allHandlers.push(typeOrHandler);
       return {
         dispose: () => {
@@ -85,9 +84,10 @@ class FakeAgentBus {
         },
       };
     }
-    const list = this.perType.get(typeOrHandler) ?? [];
+    const type = typeof typeOrHandler === 'string' ? typeOrHandler : typeOrHandler.type;
+    const list = this.perType.get(type) ?? [];
     list.push(handler!);
-    this.perType.set(typeOrHandler, list);
+    this.perType.set(type, list);
     return {
       dispose: () => {
         const i = list.indexOf(handler!);
@@ -173,34 +173,40 @@ class FakeManagerEvents {
 
 }
 
-class FakeAgentTasks {
-  private readonly listeners = new Set<(info: AgentTaskInfo) => void>();
+class FakeAgentTasks implements Pick<IAgentTaskService, 'getTask' | 'list' | 'onDidChangeTask'> {
   private readonly tasks = new Map<string, AgentTaskInfo>();
+  private readonly listeners = new Set<(info: AgentTaskInfo) => void>();
 
   readonly onDidChangeTask = (listener: (info: AgentTaskInfo) => void) => {
     this.listeners.add(listener);
     return { dispose: () => this.listeners.delete(listener) };
   };
 
-  list(activeOnly = true): AgentTaskInfo[] {
-    return [...this.tasks.values()].filter((info) => !activeOnly || info.status === 'running');
+  getTask(taskId: string): AgentTaskInfo | undefined {
+    return this.tasks.get(taskId);
+  }
+
+  list(activeOnly = true, limit?: number): AgentTaskInfo[] {
+    const infos = [...this.tasks.values()].filter((info) => !activeOnly || info.status === 'running');
+    return limit === undefined ? infos : infos.slice(0, limit);
   }
 
   change(info: AgentTaskInfo): void {
     this.tasks.set(info.taskId, info);
-    for (const listener of this.listeners) listener(info);
+    for (const listener of [...this.listeners]) listener(info);
   }
 }
 
 class FakeAgentHandle {
   readonly kind = LifecycleScope.Agent;
   readonly bus = new FakeAgentBus();
-  readonly tasks = new FakeAgentTasks();
+  readonly tasks: FakeAgentTasks;
   readonly accessor;
   readonly context: AgentContext;
   activity: AgentActivitySnapshot = {};
   private readonly services = new Map<unknown, unknown>();
   constructor(readonly id: string) {
+    this.tasks = new FakeAgentTasks();
     const scope = makeAgentScopeContext({
       agentId: id,
       agentScope: `agents/${id}`,
@@ -214,6 +220,8 @@ class FakeAgentHandle {
       register: () => ({ dispose: () => {} }),
     });
     this.services.set(IAgentLoopService, {
+      getModel: () => 'k2',
+      getEffectiveThinkingLevel: () => 'off',
       snapshot: () => ({
         state: this.activity.turn === undefined ? 'idle' : 'running',
         turn: this.activity.turn,
@@ -768,6 +776,28 @@ describe('SessionEventBroadcaster', () => {
       },
     });
     expect(globalView.deliveries).toEqual(['immediate']);
+  });
+
+  it('fans out event.session.restored to every connection, including for cold sessions', async () => {
+    const globalView = collectingTarget();
+    bc.addGlobalTarget(globalView.target);
+
+    eventBus.emit({
+      type: 'event.session.restored',
+      payload: { sessionId: 'cold-1', workspaceId: 'wd_cold' },
+    });
+
+    await vi.waitFor(() => expect(globalView.envelopes).toHaveLength(1));
+    expect(globalView.envelopes[0]).toMatchObject({
+      type: 'event.session.restored',
+      session_id: '__global__',
+      payload: {
+        type: 'event.session.restored',
+        agentId: 'main',
+        sessionId: 'cold-1',
+        workspace_id: 'wd_cold',
+      },
+    });
   });
 
   it('fans out event.session.deleted to every connection, including for cold sessions', async () => {
@@ -1696,13 +1726,13 @@ describe('SessionEventBroadcaster', () => {
       return new SessionEventBroadcaster({ core: makeCore(sessions, eventBus, metaAgents), conversations: conversationService() });
     }
 
-    function shellTask(taskId: string, status: AgentTaskInfo['status']): AgentTaskInfo {
+    function shellTask(taskId: string, status: AgentTaskInfo['status'], detached = true): AgentTaskInfo {
       return {
         taskId,
         kind: 'process',
         description: 'dev server',
         status,
-        detached: true,
+        detached,
         startedAt: 1_700_000_000_000,
         endedAt: status === 'running' ? null : 1_700_000_005_000,
         command: 'npm run dev',
@@ -1727,7 +1757,7 @@ describe('SessionEventBroadcaster', () => {
     it('lists the running tasks of every subscribed agent, then streams each change as a task frame', async () => {
       const lc = new FakeLifecycle();
       const main = lc.addAgent('main');
-      main.tasks.change(shellTask('bash-1', 'running'));
+      main.tasks.change(shellTask('bash-1', 'running', false));
       main.tasks.change(shellTask('bash-0', 'completed'));
       sessions.set('s1', lc);
       bc = makeBroadcasterForAgents();
@@ -1736,7 +1766,9 @@ describe('SessionEventBroadcaster', () => {
       const offView = collectingTarget();
       await bc.subscribe('s1', view.target, ['main']);
       await bc.subscribe('s1', offView.target, ['agent-9']);
-      main.tasks.change(shellTask('bash-1', 'killed'));
+      main.tasks.change(shellTask('bash-2', 'running', false));
+      main.tasks.change({ ...shellTask('bash-2', 'running', false), detached: true });
+      main.tasks.change(shellTask('bash-2', 'killed'));
 
       expect(taskFramesOf(view)).toEqual([
         {
@@ -1748,7 +1780,7 @@ describe('SessionEventBroadcaster', () => {
               task_id: 'bash-1',
               kind: 'shell',
               status: 'running',
-              detached: true,
+              detached: false,
               description: 'dev server',
               parent_tool_call_id: 'call_bash',
               command: 'npm run dev',
@@ -1759,7 +1791,23 @@ describe('SessionEventBroadcaster', () => {
         expect.objectContaining({
           type: 'task',
           agent_id: 'main',
-          task_id: 'bash-1',
+          task_id: 'bash-2',
+          status: 'running',
+          detached: false,
+          parent_tool_call_id: 'call_bash',
+        }),
+        expect.objectContaining({
+          type: 'task',
+          agent_id: 'main',
+          task_id: 'bash-2',
+          status: 'running',
+          detached: true,
+          parent_tool_call_id: 'call_bash',
+        }),
+        expect.objectContaining({
+          type: 'task',
+          agent_id: 'main',
+          task_id: 'bash-2',
           status: 'ended',
           outcome: 'killed',
           ended_at: new Date(1_700_000_005_000).toISOString(),
@@ -1847,10 +1895,10 @@ describe('SessionEventBroadcaster', () => {
         },
       });
       handle.set(IAgentGoalService, { getGoal: () => ({ goal }) });
-      handle.set(IAgentProfileService, {
+      Object.assign(handle.accessor.get(IAgentLoopService) as Record<string, unknown>, {
         getModel: () => 'k2',
         getEffectiveThinkingLevel: () => 'high',
-        getModelCapabilities: () => ({ max_context_tokens: 1000 }),
+        resolveModelContext: () => ({ model: { maxContextSize: 1000 } }),
       });
       handle.set(ISessionUsageService, { status: () => undefined });
       handle.set(ISessionTokenCountingService, {
@@ -1977,13 +2025,18 @@ describe('SessionEventBroadcaster', () => {
       const lc = new FakeLifecycle();
       const main = lc.addAgent('main');
       withAgentState(main);
-      main.set(IAgentProfileService, {
+      Object.assign(main.accessor.get(IAgentLoopService) as Record<string, unknown>, {
         getModel: () => model,
         getEffectiveThinkingLevel: () => 'high',
-        getModelCapabilities: () => capabilities,
+        resolveModelContext: () => ({
+          model: {
+            maxInputSize: capabilities.max_input_tokens,
+            maxContextSize: capabilities.max_context_tokens,
+          },
+        }),
       });
       main.set(IModelService, { getDefaultModel: () => 'k3' });
-      main.set(IModelCatalog, { get: () => ({ capabilities: { max_input_tokens: 800 } }) });
+      main.set(IModelCatalog, { get: () => ({ spec: { maxInputSize: 800 } }) });
       sessions.set('s1', lc);
       bc = makeBroadcasterForAgents();
 
